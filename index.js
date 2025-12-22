@@ -4,7 +4,7 @@ const fetch = require('node-fetch');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '15mb' }));
 
 const TARGET = 'https://catbypass.catapis.uk';
 
@@ -13,10 +13,73 @@ app.get('/', (req, res) => {
     res.send('CatBypass Heroku Proxy is running!');
 });
 
+// Static files handler - always return as binary
+app.get('/static/*', async (req, res) => {
+    const url = TARGET + req.originalUrl;
+    console.log('Static file:', url);
+    try {
+        const response = await fetch(url);
+        const buffer = await response.buffer();
+        
+        // Determine content type from extension
+        const ext = req.originalUrl.split('.').pop().toLowerCase();
+        const mimeTypes = {
+            'png': 'image/png',
+            'jpg': 'image/jpeg',
+            'jpeg': 'image/jpeg',
+            'gif': 'image/gif',
+            'webp': 'image/webp',
+            'svg': 'image/svg+xml',
+            'ico': 'image/x-icon',
+            'mp4': 'video/mp4',
+            'webm': 'video/webm',
+            'mp3': 'audio/mpeg',
+            'wav': 'audio/wav',
+            'css': 'text/css',
+            'js': 'application/javascript'
+        };
+        const contentType = mimeTypes[ext] || response.headers.get('content-type') || 'application/octet-stream';
+        
+        res.set('Content-Type', contentType);
+        res.status(response.status);
+        res.send(buffer);
+    } catch (e) {
+        console.error('Static file error:', e.message);
+        res.status(500).json({ error: 'Static file error', message: e.message });
+    }
+});
+
+// Profile picture raw endpoints - return binary images
+app.get('/api/profile/*/pic/raw', async (req, res) => {
+    const url = TARGET + req.originalUrl;
+    console.log('Profile pic raw:', url);
+    try {
+        const response = await fetch(url);
+        const contentType = response.headers.get('content-type') || '';
+        
+        if (contentType.startsWith('image/')) {
+            const buffer = await response.buffer();
+            res.set('Content-Type', contentType);
+            res.status(response.status);
+            res.send(buffer);
+        } else {
+            // It's JSON (error or redirect)
+            const data = await response.text();
+            res.set('Content-Type', 'application/json');
+            res.status(response.status);
+            res.send(data);
+        }
+    } catch (e) {
+        console.error('Profile pic error:', e.message);
+        res.status(500).json({ error: 'Profile pic error', message: e.message });
+    }
+});
+
 // Proxy all other requests to the real server
 app.all('*', async (req, res) => {
     // Forward the full path to the target server
     const url = TARGET + req.originalUrl;
+    console.log('Proxy:', req.method, url);
     try {
         const options = {
             method: req.method,
