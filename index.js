@@ -159,6 +159,27 @@ async function handleProxyRequest(req, res, targetUrl, useStealth) {
             const targetUrlObj = new URL(targetUrl);
             const interceptScript = `
 <script>
+// ===== IMMEDIATELY OVERRIDE CONSOLE (before IIFE) =====
+(function() {
+    var _ce = console.error;
+    console.error = function() {
+        var msg = Array.prototype.slice.call(arguments).join(' ');
+        if (msg.indexOf('missing host config') !== -1 || msg.indexOf('domainData') !== -1 || msg.indexOf('${HEROKU_BASE.replace('https://', '')}') !== -1) {
+            return;
+        }
+        return _ce.apply(console, arguments);
+    };
+    var _cw = console.warn;
+    console.warn = function() {
+        var msg = Array.prototype.slice.call(arguments).join(' ');
+        if (msg.indexOf('missing host config') !== -1 || msg.indexOf('domainData') !== -1) {
+            return;
+        }
+        return _cw.apply(console, arguments);
+    };
+})();
+</script>
+<script>
 (function() {
     const PROXY_BASE = "${HEROKU_BASE}";
     const REAL_ORIGIN = "${targetUrlObj.origin}";
@@ -170,17 +191,6 @@ async function handleProxyRequest(req, res, targetUrl, useStealth) {
     
     const encodeUrl = (url) => btoa(url).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
     const buildProxyUrl = (url) => PROXY_BASE + '/s/' + encodeUrl(url);
-    
-    // ===== SUPPRESS DOMAIN CHECK ERRORS =====
-    // Override console.error to hide "missing host config" messages
-    const originalConsoleError = console.error;
-    console.error = function(...args) {
-        const msg = args.join(' ');
-        if (msg.includes('missing host config') || msg.includes('domainData')) {
-            return; // Suppress these errors
-        }
-        return originalConsoleError.apply(console, args);
-    };
     
     // ===== CREATE LOCATION PROXY =====
     // Since we can't override window.location, we'll create global helpers
@@ -277,8 +287,17 @@ async function handleProxyRequest(req, res, targetUrl, useStealth) {
 })();
 </script>`;
             
-            // Inject the script after <head> tag
-            html = html.replace(/<head[^>]*>/i, `$&${interceptScript}`);
+            // Inject the script at the VERY BEGINNING of the HTML document
+            // This ensures it runs before any other scripts
+            if (html.includes('<!DOCTYPE') || html.includes('<!doctype')) {
+                html = html.replace(/(<!DOCTYPE[^>]*>|<!doctype[^>]*>)/i, `$1${interceptScript}`);
+            } else if (html.includes('<html')) {
+                html = html.replace(/<html[^>]*>/i, `$&${interceptScript}`);
+            } else if (html.includes('<head')) {
+                html = html.replace(/<head[^>]*>/i, `$&${interceptScript}`);
+            } else {
+                html = interceptScript + html;
+            }
             
             // Remove base tag if present (we're rewriting all URLs)
             html = html.replace(/<base[^>]*>/gi, '');
