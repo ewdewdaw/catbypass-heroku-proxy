@@ -11,13 +11,40 @@ app.use(express.raw({ type: '*/*', limit: '50mb' }));
 const TARGET = 'https://catbypass.catapis.uk';
 const HEROKU_BASE = 'https://catbypa66-d179a5790403.herokuapp.com';
 
+// ===== URL ENCODING HELPERS =====
+// Use base64 to hide the actual URLs from extensions
+function encodeUrl(url) {
+    return Buffer.from(url).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function decodeUrl(encoded) {
+    // Add back padding if needed
+    let base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+    while (base64.length % 4) base64 += '=';
+    return Buffer.from(base64, 'base64').toString('utf8');
+}
+
 // Root route for Heroku health check
 app.get('/', (req, res) => {
     res.send('CatBypass Heroku Proxy is running!');
 });
 
-// ===== WEB PROXY ENDPOINT =====
-// This proxies external websites directly without going through catbypass.catapis.uk
+// ===== STEALTH WEB PROXY ENDPOINT =====
+// Uses /s/:encoded format to hide URLs from extension blockers
+// The encoded part is base64 of the target URL
+app.all('/s/:encoded', async (req, res) => {
+    let targetUrl;
+    try {
+        targetUrl = decodeUrl(req.params.encoded);
+    } catch (e) {
+        return res.status(400).send('Invalid request');
+    }
+    
+    // Handle the request (shared with /proxy endpoint)
+    await handleProxyRequest(req, res, targetUrl, true);
+});
+
+// Legacy /proxy endpoint (still works but less stealthy)
 app.all('/proxy', async (req, res) => {
     const targetUrl = req.query.url;
     
@@ -43,6 +70,20 @@ button { padding: 12px 30px; background: linear-gradient(135deg, #5865f2, #eb459
 </div>
 </body></html>`);
     }
+    
+    await handleProxyRequest(req, res, targetUrl, false);
+});
+
+// ===== SHARED PROXY HANDLER =====
+async function handleProxyRequest(req, res, targetUrl, useStealth) {
+    // Helper to build proxy URLs
+    const buildProxyUrl = (url) => {
+        if (useStealth) {
+            return `${HEROKU_BASE}/s/${encodeUrl(url)}`;
+        } else {
+            return `${HEROKU_BASE}/proxy?url=${encodeURIComponent(url)}`;
+        }
+    };
     
     console.log('Web Proxy:', req.method, targetUrl);
     
@@ -87,22 +128,73 @@ button { padding: 12px 30px; background: linear-gradient(135deg, #5865f2, #eb459
             let html = buffer.toString('utf8');
             
             // Rewrite URLs to go through the proxy
-            // Replace absolute URLs with proxy URLs
-            html = html.replace(/(href|src|action)=["'](?:https?:)?\/\/([^"']+)["']/gi, (match, attr, url) => {
-                const fullUrl = url.startsWith('//') ? 'https:' + url : 'https://' + url;
-                return `${attr}="${HEROKU_BASE}/proxy?url=${encodeURIComponent('https://' + url)}"`;
+            // Replace absolute URLs with proxy URLs (https:// or //)
+            html = html.replace(/(href|src|action|data-src|poster)=["'](https?:\/\/[^"']+)["']/gi, (match, attr, url) => {
+                return `${attr}="${buildProxyUrl(url)}"`;
             });
             
-            // Replace relative URLs
-            html = html.replace(/(href|src|action)=["']\/([^"'\/][^"']*)["']/gi, (match, attr, path) => {
-                const fullUrl = targetOrigin + '/' + path;
-                return `${attr}="${HEROKU_BASE}/proxy?url=${encodeURIComponent(fullUrl)}"`;
+            // Handle protocol-relative URLs (//example.com)
+            html = html.replace(/(href|src|action|data-src|poster)=["'](\/\/[^"']+)["']/gi, (match, attr, url) => {
+                return `${attr}="${buildProxyUrl('https:' + url)}"`;
             });
             
-            // Inject base tag to help with relative URLs
-            if (!html.includes('<base')) {
-                html = html.replace(/<head[^>]*>/i, `$&<base href="${targetOrigin}/">`);
-            }
+            // Replace root-relative URLs (/path/to/file)
+            html = html.replace(/(href|src|action|data-src|poster)=["'](\/[^"'\/][^"']*)["']/gi, (match, attr, path) => {
+                const fullUrl = targetOrigin + path;
+                return `${attr}="${buildProxyUrl(fullUrl)}"`;
+            });
+            
+            // Rewrite inline styles with url()
+            html = html.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/gi, (match, url) => {
+                return `url("${buildProxyUrl(url)}")`;
+            });
+            
+            // Rewrite srcset attributes
+            html = html.replace(/srcset=["']([^"']+)["']/gi, (match, srcset) => {
+                const rewritten = srcset.replace(/(https?:\/\/[^\s,]+)/gi, (url) => buildProxyUrl(url));
+                return `srcset="${rewritten}"`;
+            });
+            
+            // Inject script to intercept dynamic requests (fetch, XHR, etc)
+            const interceptScript = `
+<script>
+(function() {
+    const PROXY_BASE = "${HEROKU_BASE}";
+    const encodeUrl = (url) => btoa(url).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
+    const buildProxyUrl = (url) => PROXY_BASE + '/s/' + encodeUrl(url);
+    
+    // Intercept fetch
+    const originalFetch = window.fetch;
+    window.fetch = function(input, init) {
+        if (typeof input === 'string' && input.startsWith('http') && !input.includes(PROXY_BASE)) {
+            input = buildProxyUrl(input);
+        }
+        return originalFetch.call(this, input, init);
+    };
+    
+    // Intercept XHR
+    const originalOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url, ...args) {
+        if (typeof url === 'string' && url.startsWith('http') && !url.includes(PROXY_BASE)) {
+            url = buildProxyUrl(url);
+        }
+        return originalOpen.call(this, method, url, ...args);
+    };
+    
+    // Intercept WebSocket
+    const OriginalWebSocket = window.WebSocket;
+    window.WebSocket = function(url, protocols) {
+        // WebSocket proxying would need a different approach
+        return new OriginalWebSocket(url, protocols);
+    };
+})();
+</script>`;
+            
+            // Inject the script after <head> tag
+            html = html.replace(/<head[^>]*>/i, `$&${interceptScript}`);
+            
+            // Remove base tag if present (we're rewriting all URLs)
+            html = html.replace(/<base[^>]*>/gi, '');
             
             res.set('Content-Type', 'text/html; charset=utf-8');
             res.send(html);
@@ -111,11 +203,30 @@ button { padding: 12px 30px; background: linear-gradient(135deg, #5865f2, #eb459
             
             // Rewrite url() in CSS
             css = css.replace(/url\(["']?(https?:\/\/[^"')]+)["']?\)/gi, (match, url) => {
-                return `url("${HEROKU_BASE}/proxy?url=${encodeURIComponent(url)}")`;
+                return `url("${buildProxyUrl(url)}")`;
+            });
+            
+            // Rewrite relative URLs in CSS
+            css = css.replace(/url\(["']?(\/[^"')]+)["']?\)/gi, (match, path) => {
+                const fullUrl = targetOrigin + path;
+                return `url("${buildProxyUrl(fullUrl)}")`;
             });
             
             res.set('Content-Type', contentType);
             res.send(css);
+        } else if (contentType.includes('javascript') || contentType.includes('application/json')) {
+            // For JS/JSON, try to rewrite any hardcoded URLs
+            let text = buffer.toString('utf8');
+            
+            // Rewrite absolute URLs in strings
+            text = text.replace(/(["'])(https?:\/\/[^"']+)(["'])/gi, (match, q1, url, q2) => {
+                // Skip if it's already proxied or is the proxy base
+                if (url.includes(HEROKU_BASE)) return match;
+                return `${q1}${buildProxyUrl(url)}${q2}`;
+            });
+            
+            res.set('Content-Type', contentType);
+            res.send(text);
         } else {
             // Binary content - pass through as-is
             res.set('Content-Type', contentType);
@@ -125,12 +236,12 @@ button { padding: 12px 30px; background: linear-gradient(135deg, #5865f2, #eb459
         console.error('Web proxy error:', e.message);
         res.status(500).send(`<html><body style="background:#1a1a2e;color:#fff;font-family:sans-serif;padding:40px;text-align:center;">
             <h1>🐱 Proxy Error</h1>
-            <p>Failed to load: ${targetUrl}</p>
+            <p>Failed to load</p>
             <p style="color:#ff6b6b;">${e.message}</p>
             <a href="javascript:history.back()" style="color:#5865f2;">Go Back</a>
         </body></html>`);
     }
-});
+}
 
 // Static files handler - always return as binary
 app.get('/static/*', async (req, res) => {
