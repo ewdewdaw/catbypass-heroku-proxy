@@ -171,11 +171,25 @@ async function handleProxyRequest(req, res, targetUrl, useStealth) {
     const encodeUrl = (url) => btoa(url).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
     const buildProxyUrl = (url) => PROXY_BASE + '/s/' + encodeUrl(url);
     
-    // ===== SPOOF LOCATION =====
-    // Create a fake location object that looks like the real site
-    const fakeLocation = {
-        ancestorOrigins: window.location.ancestorOrigins,
-        hash: window.location.hash,
+    // ===== SUPPRESS DOMAIN CHECK ERRORS =====
+    // Override console.error to hide "missing host config" messages
+    const originalConsoleError = console.error;
+    console.error = function(...args) {
+        const msg = args.join(' ');
+        if (msg.includes('missing host config') || msg.includes('domainData')) {
+            return; // Suppress these errors
+        }
+        return originalConsoleError.apply(console, args);
+    };
+    
+    // ===== CREATE LOCATION PROXY =====
+    // Since we can't override window.location, we'll create global helpers
+    window.__CATBYPASS_REAL_HOST__ = REAL_HOSTNAME;
+    window.__CATBYPASS_REAL_ORIGIN__ = REAL_ORIGIN;
+    window.__CATBYPASS_REAL_HREF__ = REAL_HREF;
+    
+    // Create a location-like object for scripts that read from a variable
+    window.__location__ = {
         host: REAL_HOST,
         hostname: REAL_HOSTNAME,
         href: REAL_HREF,
@@ -184,53 +198,40 @@ async function handleProxyRequest(req, res, targetUrl, useStealth) {
         port: "${targetUrlObj.port || ''}",
         protocol: REAL_PROTOCOL,
         search: window.location.search,
-        assign: function(url) { window.location.assign(buildProxyUrl(url)); },
-        reload: function() { window.location.reload(); },
-        replace: function(url) { window.location.replace(buildProxyUrl(url)); },
-        toString: function() { return REAL_HREF; }
+        hash: window.location.hash
     };
     
-    // Try to override location using Object.defineProperty
-    try {
-        Object.defineProperty(window, 'location', {
-            get: function() { return fakeLocation; },
-            configurable: false
-        });
-    } catch(e) {
-        // Location override failed - some browsers prevent this
-        console.log('[CatBypass] Location spoof not available');
-    }
+    // ===== PATCH HOSTNAME CHECKS =====
+    // Intercept string includes/indexOf to trick domain checks
+    const originalIncludes = String.prototype.includes;
+    String.prototype.includes = function(search, position) {
+        // If checking for heroku domain, pretend it's not there
+        if (search === 'herokuapp.com' || search === 'catbypa66') {
+            if (this.indexOf('catbypa66') !== -1) return false;
+        }
+        return originalIncludes.call(this, search, position);
+    };
     
-    // Spoof document.location too
-    try {
-        Object.defineProperty(document, 'location', {
-            get: function() { return fakeLocation; },
-            configurable: false
-        });
-    } catch(e) {}
-    
-    // Spoof document.domain
+    // ===== SPOOF DOCUMENT PROPERTIES =====
     try {
         Object.defineProperty(document, 'domain', {
             get: function() { return REAL_HOSTNAME; },
             set: function() {},
-            configurable: false
+            configurable: true
         });
     } catch(e) {}
     
-    // Spoof document.URL
     try {
         Object.defineProperty(document, 'URL', {
             get: function() { return REAL_HREF; },
-            configurable: false
+            configurable: true
         });
     } catch(e) {}
     
-    // Spoof document.referrer
     try {
         Object.defineProperty(document, 'referrer', {
             get: function() { return REAL_ORIGIN + '/'; },
-            configurable: false
+            configurable: true
         });
     } catch(e) {}
     
