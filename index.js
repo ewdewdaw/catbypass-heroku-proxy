@@ -155,38 +155,124 @@ async function handleProxyRequest(req, res, targetUrl, useStealth) {
                 return `srcset="${rewritten}"`;
             });
             
-            // Inject script to intercept dynamic requests (fetch, XHR, etc)
+            // Inject script to intercept dynamic requests AND spoof location
+            const targetUrlObj = new URL(targetUrl);
             const interceptScript = `
 <script>
 (function() {
     const PROXY_BASE = "${HEROKU_BASE}";
+    const REAL_ORIGIN = "${targetUrlObj.origin}";
+    const REAL_HOST = "${targetUrlObj.host}";
+    const REAL_HOSTNAME = "${targetUrlObj.hostname}";
+    const REAL_HREF = "${targetUrl}";
+    const REAL_PATHNAME = "${targetUrlObj.pathname}";
+    const REAL_PROTOCOL = "${targetUrlObj.protocol}";
+    
     const encodeUrl = (url) => btoa(url).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=+$/, '');
     const buildProxyUrl = (url) => PROXY_BASE + '/s/' + encodeUrl(url);
     
-    // Intercept fetch
+    // ===== SPOOF LOCATION =====
+    // Create a fake location object that looks like the real site
+    const fakeLocation = {
+        ancestorOrigins: window.location.ancestorOrigins,
+        hash: window.location.hash,
+        host: REAL_HOST,
+        hostname: REAL_HOSTNAME,
+        href: REAL_HREF,
+        origin: REAL_ORIGIN,
+        pathname: REAL_PATHNAME,
+        port: "${targetUrlObj.port || ''}",
+        protocol: REAL_PROTOCOL,
+        search: window.location.search,
+        assign: function(url) { window.location.assign(buildProxyUrl(url)); },
+        reload: function() { window.location.reload(); },
+        replace: function(url) { window.location.replace(buildProxyUrl(url)); },
+        toString: function() { return REAL_HREF; }
+    };
+    
+    // Try to override location using Object.defineProperty
+    try {
+        Object.defineProperty(window, 'location', {
+            get: function() { return fakeLocation; },
+            configurable: false
+        });
+    } catch(e) {
+        // Location override failed - some browsers prevent this
+        console.log('[CatBypass] Location spoof not available');
+    }
+    
+    // Spoof document.location too
+    try {
+        Object.defineProperty(document, 'location', {
+            get: function() { return fakeLocation; },
+            configurable: false
+        });
+    } catch(e) {}
+    
+    // Spoof document.domain
+    try {
+        Object.defineProperty(document, 'domain', {
+            get: function() { return REAL_HOSTNAME; },
+            set: function() {},
+            configurable: false
+        });
+    } catch(e) {}
+    
+    // Spoof document.URL
+    try {
+        Object.defineProperty(document, 'URL', {
+            get: function() { return REAL_HREF; },
+            configurable: false
+        });
+    } catch(e) {}
+    
+    // Spoof document.referrer
+    try {
+        Object.defineProperty(document, 'referrer', {
+            get: function() { return REAL_ORIGIN + '/'; },
+            configurable: false
+        });
+    } catch(e) {}
+    
+    // ===== INTERCEPT FETCH =====
     const originalFetch = window.fetch;
     window.fetch = function(input, init) {
         if (typeof input === 'string' && input.startsWith('http') && !input.includes(PROXY_BASE)) {
             input = buildProxyUrl(input);
+        } else if (typeof input === 'string' && input.startsWith('/')) {
+            input = buildProxyUrl(REAL_ORIGIN + input);
         }
         return originalFetch.call(this, input, init);
     };
     
-    // Intercept XHR
+    // ===== INTERCEPT XHR =====
     const originalOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url, ...args) {
         if (typeof url === 'string' && url.startsWith('http') && !url.includes(PROXY_BASE)) {
             url = buildProxyUrl(url);
+        } else if (typeof url === 'string' && url.startsWith('/')) {
+            url = buildProxyUrl(REAL_ORIGIN + url);
         }
         return originalOpen.call(this, method, url, ...args);
     };
     
-    // Intercept WebSocket
+    // ===== INTERCEPT WEBSOCKET =====
     const OriginalWebSocket = window.WebSocket;
     window.WebSocket = function(url, protocols) {
         // WebSocket proxying would need a different approach
         return new OriginalWebSocket(url, protocols);
     };
+    
+    // ===== SPOOF postMessage origin checks =====
+    const originalPostMessage = window.postMessage;
+    window.postMessage = function(message, targetOrigin, transfer) {
+        if (targetOrigin === '*' || targetOrigin === REAL_ORIGIN) {
+            return originalPostMessage.call(this, message, '*', transfer);
+        }
+        return originalPostMessage.call(this, message, targetOrigin, transfer);
+    };
+    
+    console.log('[CatBypass] Proxy initialized for: ' + REAL_HOSTNAME);
 })();
 </script>`;
             
